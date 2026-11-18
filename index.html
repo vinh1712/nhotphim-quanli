@@ -3575,6 +3575,12 @@ function submitFilm() {
               if (q) toast("🏷️ Chất lượng tự nhận diện: " + q + " — " + title);
             }).catch(() => {});
           }
+          // Để trống ô "Đánh giá" -> tự tra điểm IMDb trên OMDb ở nền
+          if (!String(newFilm.rating || "").trim() || newFilm.rating === "N/A") {
+            autoFillImdb(newFilm).then(r => {
+              if (r) toast("⭐ Điểm IMDb tự nhận diện: " + r + " — " + title);
+            }).catch(() => {});
+          }
           // Phim bộ đang chiếu mà tổng tập <= số tập hiện tại (4/4...) -> tự sửa từ nguồn ở nền
           if (newFilm.type === "series") {
             autoFixTotalEp(newFilm).then(t => {
@@ -6111,6 +6117,98 @@ async function _findOphimSlugByTitle(m) {
         }
       }
 
+/* ===== TỰ ĐIỀN TẬP + LINK SV1 (NguonC) CÒN THIẾU KHI MỞ TRANG QUẢN LÍ =====
+   Quét phim bộ còn tập thiếu link SV1 (link), tự tìm đúng phim trên NguonC
+   (khớp tên + năm + quốc gia), rồi CHỈ điền/link các tập đang trống + thêm tập
+   mới NguonC có mà DB chưa có — KHÔNG bao giờ ghi đè link đã có, KHÔNG xóa tập. */
+let _sv1AutoRunning = false;
+async function autoFillMissingSV1() {
+  if (_sv1AutoRunning || _syncRunning) return;
+  _sv1AutoRunning = true;
+  try {
+    if (!(await ensureAllEpisodes())) return;
+    const targets = MOVIES.filter((m) =>
+      m.type !== "movie" && m._epLoaded !== false &&
+      Array.isArray(m.episodes) && m.episodes.some((e) => !e || !e.link)
+    );
+    if (!targets.length) return;
+    console.info(`[SV1] ${targets.length} phim thiếu link SV1 (NguonC) — tự điền ở nền...`);
+    let filledFilms = 0, filledEps = 0, notFound = 0;
+    for (const m of targets) {
+      if (_syncRunning) break; // admin bấm sync thủ công -> nhường lại
+      try {
+        const names = [m.title, m.titleEn];
+        const ctx = _filmCtx(m.country, m.titleEn);
+        const same = (d) => !!(d && d.movie && _isSameFilm(names, m.year, d.movie, ctx));
+        let slug = m.ophimSlug || "";
+        let data = slug ? await MovieAPI.detail(slug) : null;
+        if (!same(data)) {
+          // slug trống hoặc trỏ sai phim -> thử tìm lại theo tên (khớp chính xác)
+          const alt = await _findOphimSlugByTitle(m);
+          if (alt && alt !== slug) {
+            const d2 = await MovieAPI.detail(alt);
+            if (same(d2)) { data = d2; slug = alt; }
+          }
+        }
+        if (!same(data)) {
+          notFound++;
+          console.warn(`[SV1] ${m.title}: không tìm/khớp được phim trên NguonC (bỏ qua, không đụng link cũ)`);
+          continue;
+        }
+        const serverData = pickVietsubServerData(data.episodes || [], _extractEpNum(data.movie.episode_current));
+        if (!serverData.length) { notFound++; continue; }
+        if (slug && slug !== m.ophimSlug) { m.ophimSlug = slug; } // gắn slug đúng để lần sau khỏi tìm lại
+        const byKey = {};
+        serverData.forEach((ep, i) => {
+          const k = _epKey(ep.name || ("Tập " + (i + 1)));
+          if (!byKey[k]) byKey[k] = ep;
+        });
+        let n = 0;
+        const merged = (m.episodes || []).map((e) => {
+          if (!e || e.link || !e.name) return e;
+          const src = byKey[_epKey(e.name)];
+          if (src && src.link_embed) { n++; return { ...e, link: src.link_embed }; }
+          return e;
+        });
+        // Tập NguonC có nhưng DB chưa có -> thêm vào (SV1 trống, các SV khác giữ nguyên)
+        const have = new Set(merged.filter(Boolean).map((e) => _epKey(e.name)));
+        serverData.forEach((ep, i) => {
+          const nm = ep.name || ("Tập " + (i + 1));
+          const k = _epKey(nm);
+          if (have.has(k)) return;
+          have.add(k);
+          merged.push({ name: nm, link: ep.link_embed || "" });
+          n++;
+        });
+        if (!n) continue;
+        if (merged.every((x) => x && _extractEpNum(x.name) > 0)) merged.sort((a, b) => _extractEpNum(a.name) - _extractEpNum(b.name));
+        // Ghi CHỈ cột episodes để không đụng các cột khác của phim
+        const res = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${m.id}`, {
+          method: "PATCH",
+          headers: SB_HEADERS,
+          body: JSON.stringify({ episodes: JSON.stringify(merged), ophim_slug: m.ophimSlug || null }),
+        });
+        if (!res.ok) {
+          console.warn(`[SV1] ${m.title}: ghi DB lỗi ${res.status}`, await res.text());
+          continue;
+        }
+        m.episodes = merged;
+        filledFilms++; filledEps += n;
+        console.log(`[SV1] ${m.title}: đã điền ${n} tập SV1 từ NguonC (slug: ${slug})`);
+        await new Promise((r) => setTimeout(r, 300));
+      } catch (e) {
+        console.warn(`[SV1] ${m.title}: lỗi`, e);
+      }
+    }
+    if (filledFilms) toast(`✅ Đã tự điền SV1 (NguonC) cho ${filledFilms} phim (${filledEps} tập)`);
+    console.info(`[SV1] Xong: ${filledFilms} phim / ${filledEps} tập được điền, ${notFound} phim không tìm thấy trên NguonC.`);
+  } catch (e) {
+    console.warn("autoFillMissingSV1 lỗi:", e);
+  } finally {
+    _sv1AutoRunning = false;
+  }
+}
+
 async function _syncFromKKPhimOnly(m) {
         // Fallback khi phim không có trên NguonC: lấy tập mới + SV2 (KKPhim) + SV3 (VodPhim).
         const kk = await _getKKPhimFullDataForSync(m);
@@ -6214,6 +6312,40 @@ async function autoFillQuality(film) {
     }
   }
   return q;
+}
+
+/* Tự điền ĐIỂM IMDb (OMDb) cho phim mới thêm khi admin để trống ô "Đánh giá":
+   chạy nền sau khi đã lưu phim, không chặn thêm phim. Ghi cả rating + extra.imdbId/imdbScore. */
+async function autoFillImdb(film) {
+  if (!film || !film.id) return "";
+  const cur = String(film.rating || "").trim();
+  if (cur && cur !== "N/A") return "";
+  let hit = null;
+  try {
+    hit = await omdbLookup(film.titleEn, film.title, film.year);
+  } catch (e) { console.warn("autoFillImdb lỗi:", e); }
+  if (!hit) return "";
+  film.rating = hit.rating;
+  const oldExtra = film.extra && typeof film.extra === "object" ? film.extra : {};
+  const body = { rating: hit.rating, extra: { ...oldExtra, imdbId: hit.imdbId, imdbScore: hit.rating } };
+  try {
+    let r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${film.id}`, {
+      method: "PATCH", headers: SB_HEADERS, body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      // bảng thiếu cột extra -> chỉ ghi rating
+      r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${film.id}`, {
+        method: "PATCH", headers: SB_HEADERS, body: JSON.stringify({ rating: hit.rating }),
+      });
+    }
+    if (r.ok) {
+      film.extra = body.extra;
+      console.info("[IMDB] Đã tự đặt", hit.rating, "cho", film.title, hit.imdbId);
+      try { renderManageList(); } catch (_) {}
+      return hit.rating;
+    }
+  } catch (e) { console.warn("autoFillImdb PATCH lỗi:", e); }
+  return "";
 }
 
 /* Tự sửa TỔNG SỐ TẬP cho MỘT phim bộ (chống hiển thị 4/4 khi phim chưa chiếu hết):
@@ -7916,6 +8048,9 @@ async function bootAdmin() {
     updateStats();
     renderManageList();
     loadAdminNotifs();
+    // Tự điền tập/link SV1 (NguonC) còn thiếu — chạy NỀN sau khi trang đã hiển thị,
+    // không chặn giao diện. (bấm Stop trong console: _sv1AutoRunning = true)
+    setTimeout(() => { autoFillMissingSV1().catch((e) => console.warn("autoFillMissingSV1:", e)); }, 2500);
   } catch (e) {
     console.error("Lỗi khởi động:", e);
   } finally {
@@ -8117,7 +8252,7 @@ window.addEventListener("DOMContentLoaded", bootAdmin);
             <div>${L("Điểm TMDB")}${inp("tmdbScore", "0", "number", 'min="0" max="10" step="0.1"')}</div>
             <div>${L("Điểm IMDB")}${inp("imdbScore", "0", "number", 'min="0" max="10" step="0.1"')}</div>
           </div>
-          <div style="margin-top:10px"><button class="btn-s" onclick="edTmdb()">⬇ Lấy dữ liệu từ TMDB (điểm, diễn viên, đạo diễn...)</button></div>
+          <div style="margin-top:10px"><button class="btn-s" onclick="edTmdb()">⬇ Lấy dữ liệu từ TMDB (điểm, diễn viên, đạo diễn...)</button> <button class="btn-s" onclick="edOmdb()">⭐ Lấy điểm IMDb (OMDb)</button></div>
         </div>
 
         <div class="ed-card">
@@ -8541,6 +8676,98 @@ window.addEventListener("DOMContentLoaded", bootAdmin);
     } catch (e) { toast("❌ " + e.message); }
   }
 
+  /* ---------- OMDb: tự lấy điểm IMDb (không cần key, cho phép CORS) ---------- */
+  async function omdbApi(q) {
+    try {
+      const r = await fetch(`https://www.omdbapi.com/?${q}&apikey=trilogy`, { cache: "no-store" });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return j && j.Response === "True" ? j : null;
+    } catch (e) { console.warn("OMDb lỗi:", e); return null; }
+  }
+  // Chuẩn hóa tên để so khớp (bỏ dấu, hoa-thường, & == and)
+  function _omdbNorm(s) {
+    return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
+  }
+  // Năm phim có nằm trong khoảng năm OMDb ("2015-2022", "2021-", "2019") không
+  function _omdbYearOk(omdbYear, target) {
+    if (!target) return true;
+    const t = parseInt(target, 10); if (!isFinite(t)) return true;
+    const s = String(omdbYear || "");
+    const a = parseInt(s, 10); if (!isFinite(a)) return true;
+    const b = parseInt(s.split("-")[1] || "", 10);
+    const end = isFinite(b) ? b : (s.endsWith("-") ? 9999 : a);
+    return t >= a - 1 && t <= end + 1;
+  }
+  // Ứng viên tên: bản gốc + bản bỏ ngoặc cuối / năm cuối / "Season N"
+  function _omdbNames(titleEn, title) {
+    const out = [];
+    const add = (s) => { s = String(s || "").trim().replace(/\s+/g, " "); if (s && out.indexOf(s) === -1) out.push(s); };
+    const strip = (n) => n
+      .replace(/\s*[\(（][^)）]*[\)）]\s*$/g, "")
+      .replace(/\s*[-–—:.]?\s*(?:19|20)\d{2}\s*$/g, "")
+      .replace(/\s*[\(（]\s*(?:season|phần|part|ss|pt)\s*\d{1,2}\s*[\)）]/ig, " ")
+      .replace(/\s+(?:season|phần|part|ss|pt)\s*\d{1,2}\s*$/ig, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    add(titleEn); add(title);
+    for (const n of out.slice()) {
+      let c = n;
+      for (let i = 0; i < 3; i++) { const d = strip(c); if (!d || d === c) break; add(d); c = d; }
+    }
+    return out;
+  }
+  // Chỉ chấp nhận khi TÊN y hệt (không trúng phim phụ), KHÔNG phải tập phụ, năm hợp lệ.
+  // Phim có "(Season N)" -> bỏ kiểm tra năm vì OMDb cho điểm cả series.
+  function _omdbAccept(j, cand, hasSeason, year) {
+    if (!j || j.Response !== "True" || !j.imdbID) return false;
+    if (j.Type === "episode") return false;
+    if (_omdbNorm(j.Title) !== _omdbNorm(cand)) return false;
+    const r = String(j.imdbRating || "");
+    if (!/^\d+(\.\d+)?$/.test(r)) return false;
+    if (!hasSeason && !_omdbYearOk(j.Year, year)) return false;
+    return true;
+  }
+  // Trả { imdbId, rating, matchedTitle, matchedYear } hoặc null
+  async function omdbLookup(titleEn, title, year) {
+    const names = _omdbNames(titleEn, title);
+    if (!names.length) return null;
+    const y = String(year || "").trim();
+    const hasSeason = /\b(season|phần|part|ss|pt)\s*\d{1,2}\b/i.test(String(titleEn || "") + " " + String(title || ""));
+    for (const name of names) {
+      const enc = encodeURIComponent(name);
+      const tries = y ? [`t=${enc}&y=${encodeURIComponent(y)}`, `t=${enc}`] : [`t=${enc}`];
+      for (const q of tries) {
+        const j = await omdbApi(q);
+        if (_omdbAccept(j, name, hasSeason, y)) return { imdbId: j.imdbID, rating: String(j.imdbRating), matchedTitle: j.Title, matchedYear: j.Year };
+      }
+    }
+    // Tìm kiếm: chỉ chọn kết quả tên y hệt ứng viên (loại phim phụ)
+    for (const name of names.slice(0, 3)) {
+      const j = await omdbApi(`s=${encodeURIComponent(name)}`);
+      if (!j || !Array.isArray(j.Search) || !j.Search.length) continue;
+      const cands = j.Search.filter((x) => x.Type !== "episode" && _omdbNorm(x.Title) === _omdbNorm(name));
+      for (const c of cands.slice(0, 3)) {
+        const d = await omdbApi(`i=${encodeURIComponent(c.imdbID)}`);
+        if (_omdbAccept(d, name, hasSeason, y)) return { imdbId: d.imdbID, rating: String(d.imdbRating), matchedTitle: d.Title, matchedYear: d.Year };
+      }
+    }
+    return null;
+  }
+  // Nút trong form sửa phim: tự điền Điểm IMDB + IMDB ID
+  async function edOmdb() {
+    const f = ED.f;
+    if (!String(f.title || "").trim() && !String(f.titleEn || "").trim()) { toast("❗ Nhập tên phim trước"); return; }
+    toast("⏳ Đang tra điểm IMDb trên OMDb...");
+    const hit = await omdbLookup(f.titleEn, f.title, f.year);
+    if (!hit) { toast("❌ OMDb không tìm thấy phim này (thử đổi tên gốc / năm)"); return; }
+    f.imdbId = hit.imdbId;
+    f.imdbScore = hit.rating;
+    edRender();
+    toast(`✅ IMDb ${hit.rating} · ${hit.matchedTitle} (${hit.matchedYear}) · ${hit.imdbId}`);
+  }
+
   /* ---------- Lưu ---------- */
   async function edSend(payload, id) {
     const missing = [];
@@ -8595,7 +8822,17 @@ window.addEventListener("DOMContentLoaded", bootAdmin);
       ? (done ? "Full " + (total || eps.length) + " tập" : "Tập " + cur + (total ? "/" + total : ""))
       : (f.status === "Trailer" ? "Trailer" : f.status === "Sắp chiếu" ? "Sắp chiếu" : "Full");
     const quality = f.quality || ["4K", "HD"].find((x) => f.formats.includes(x)) || "";
-    const rating = parseFloat(f.imdbScore) > 0 ? String(f.imdbScore) : parseFloat(f.tmdbScore) > 0 ? String(f.tmdbScore) : "N/A";
+    let rating = parseFloat(f.imdbScore) > 0 ? String(f.imdbScore) : parseFloat(f.tmdbScore) > 0 ? String(f.tmdbScore) : "N/A";
+    // Chưa có điểm nào -> tự tra IMDb trên OMDb trước khi lưu (không chặn lưu nếu OMDb chậm/lỗi)
+    if (rating === "N/A" && (String(f.title || "").trim() || String(f.titleEn || "").trim())) {
+      try {
+        const hit = await Promise.race([
+          omdbLookup(f.titleEn, f.title, f.year),
+          new Promise((r) => setTimeout(() => r(null), 8000)),
+        ]);
+        if (hit) { f.imdbId = hit.imdbId; f.imdbScore = hit.rating; rating = hit.rating; }
+      } catch (e) { console.warn("OMDb (edSave) lỗi:", e); }
+    }
     const extra = {
       slug: f.slug || _slug(f.title), status: f.status, theater: !!f.theater, featured: !!f.featured, trailer: f.trailer, videoCode: f.videoCode,
       duration: f.duration, notice: f.notice, tmdbId: f.tmdbId, imdbId: f.imdbId, tmdbScore: f.tmdbScore, imdbScore: f.imdbScore,
@@ -8669,7 +8906,8 @@ window.addEventListener("DOMContentLoaded", bootAdmin);
   ADM_HOOK.editor = () => { if (!g("ed-root")) { if (ED.f.title === undefined) { ED.f = edBlank(); } edRender(); } };
 
   Object.assign(window, {
-    edOpen, edBack, edSave, edTab, edUpload, edDrop, edSuggest, edJoin, edShowAdd, edShowDel, edTmdb,
+    edOpen, edBack, edSave, edTab, edUpload, edDrop, edSuggest, edJoin, edShowAdd, edShowDel, edTmdb, edOmdb,
+    omdbLookup, omdbApi, autoFillImdb,
     edSv, edPage, edEpAdd, edEpDel, edEpGen, edEpClear, edBulkToggle, edBulkApply, edSearchSrc, edPick, edAutoAll,
     g_edFile: (k) => { const e = g("ed-file-" + k); if (e) e.click(); },
     g_v: (id) => (g(id) ? g(id).value : ""),
